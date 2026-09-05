@@ -1,7 +1,9 @@
-import type {
-  ExtensionAPI,
-  ExtensionCommandContext,
-  ExtensionContext,
+import {
+  SessionManager,
+  type ExtensionAPI,
+  type ExtensionCommandContext,
+  type ExtensionContext,
+  type SessionStartEvent,
 } from "@earendil-works/pi-coding-agent";
 import { getSettingsListTheme } from "@earendil-works/pi-coding-agent";
 import {
@@ -32,6 +34,7 @@ import type {
 const STATUS_KEY = "codex-accounts";
 const SELECTION_ENTRY_TYPE = "codex-account-selection";
 const LEGACY_SELECTION_ENTRY_TYPE = "pi-accounts-selection";
+const MODEL_HANDOFF_ENTRY_TYPE = "model-handoff-on-new-session";
 const PROVIDER_ID = "openai-codex";
 const QUERY_INTERVAL_MS = 60 * 1_000;
 const COUNTDOWN_INTERVAL_MS = 60 * 1_000;
@@ -392,7 +395,15 @@ export default function codexAccountExtension(pi: ExtensionAPI) {
     },
   });
 
-  pi.on("session_start", async (_event, ctx) => {
+  pi.on("session_before_switch", (event, ctx) => {
+    if (event.reason !== "new" || !ctx.model) return;
+    pi.appendEntry(MODEL_HANDOFF_ENTRY_TYPE, {
+      provider: ctx.model.provider,
+      modelId: ctx.model.id,
+    });
+  });
+
+  pi.on("session_start", async (event, ctx) => {
     sessionActive = true;
     authFailed = false;
     sessionController = new AbortController();
@@ -426,6 +437,8 @@ export default function codexAccountExtension(pi: ExtensionAPI) {
       sessionAccount = undefined;
       authFailed = true;
     }
+
+    await restoreModelForNewSession(pi, event, ctx);
 
     countdownTimer = setInterval(
       () => publishStatus(ctx),
@@ -471,6 +484,47 @@ export default function codexAccountExtension(pi: ExtensionAPI) {
     await sessionAuth.clear(ctx);
     ctx.ui.setStatus(STATUS_KEY, undefined);
   });
+}
+
+// /new 前把当前模型写入旧会话，新会话完成账户认证后再恢复；启动和 /resume 均不介入。
+async function restoreModelForNewSession(
+  pi: ExtensionAPI,
+  event: SessionStartEvent,
+  ctx: ExtensionContext,
+): Promise<void> {
+  if (event.reason !== "new" || !event.previousSessionFile) return;
+
+  let entries;
+  try {
+    entries = SessionManager.open(event.previousSessionFile).getBranch();
+  } catch (error) {
+    ctx.ui.notify(`读取上一个会话模型失败：${errorMessage(error)}`, "warning");
+    return;
+  }
+
+  const handoff = [...entries].reverse().find(
+    (entry) =>
+      entry.type === "custom" &&
+      entry.customType === MODEL_HANDOFF_ENTRY_TYPE,
+  );
+  const data = handoff?.type === "custom" ? asRecord(handoff.data) : undefined;
+  const provider = data?.provider;
+  const modelId = data?.modelId;
+  if (typeof provider !== "string" || typeof modelId !== "string") {
+    ctx.ui.notify("上一个会话没有有效的模型交接记录。", "warning");
+    return;
+  }
+
+  const model = ctx.modelRegistry.find(provider, modelId);
+  if (!model) {
+    ctx.ui.notify(`上一个会话使用的模型 ${provider}/${modelId} 当前不可用。`, "warning");
+    return;
+  }
+  if (ctx.model?.provider === provider && ctx.model.id === modelId) return;
+
+  if (!(await pi.setModel(model))) {
+    ctx.ui.notify(`无法恢复模型 ${provider}/${modelId}：未配置认证。`, "warning");
+  }
 }
 
 function restoreSessionAccount(
