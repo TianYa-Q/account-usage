@@ -1,0 +1,24 @@
+{
+  "name": "pi-codex-account-usage-local",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "format": "prettier --write '*.ts' package.json tsconfig.json",
+    "format:check": "prettier --check '*.ts' package.json tsconfig.json",
+    "typecheck": "tsc --noEmit",
+    "lint": "oxlint . --ignore-pattern node_modules"
+  },
+  "dependencies": {
+    "proper-lockfile": "4.1.2"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "0.84.4",
+    "@earendil-works/pi-coding-agent": "0.84.4",
+    "@earendil-works/pi-tui": "0.84.4",
+    "@types/proper-lockfile": "4.1.4",
+    "oxlint": "^1.14.0",
+    "prettier": "3.6.2",
+    "typescript": "7.0.2"
+  }
+}
