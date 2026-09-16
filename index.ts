@@ -12,11 +12,20 @@ import {
   SettingsList,
   Text,
 } from "@earendil-works/pi-tui";
+import {
+  antigravityGUIStatus,
+  formatAntigravityStatus,
+  queryAntigravityUsage,
+  type AntigravityUsageState,
+} from "./antigravity.js";
 import { CodexSessionAuth } from "./auth.js";
 import { queryAccountUsage } from "./codex.js";
 import { formatStatusSegment, formatUsageSummary } from "./format.js";
 import { loginCodexAccount } from "./oauth.js";
 import {
+  appendAutoWarmupRecords,
+  claimAutoWarmupWindow,
+  readAutoWarmupRecords,
   readCodexAccountState,
   readSettings,
   removeAccount,
@@ -26,18 +35,25 @@ import {
 } from "./store.js";
 import type {
   AccountUsage,
+  AutoWarmupRecord,
   CodexAccount,
   CodexAccountState,
   UsageSettings,
 } from "./types.js";
 
-const STATUS_KEY = "codex-accounts";
+const STATUS_KEY = "account-usage";
+const GUI_STATUS_KEY = "account-usage-gui";
 const SELECTION_ENTRY_TYPE = "codex-account-selection";
 const LEGACY_SELECTION_ENTRY_TYPE = "pi-accounts-selection";
 const MODEL_HANDOFF_ENTRY_TYPE = "model-handoff-on-new-session";
 const PROVIDER_ID = "openai-codex";
 const QUERY_INTERVAL_MS = 60 * 1_000;
+const ANTIGRAVITY_QUERY_INTERVAL_MS = 5 * 60 * 1_000;
 const COUNTDOWN_INTERVAL_MS = 60 * 1_000;
+const FIVE_HOUR_WINDOW_SECONDS = 5 * 60 * 60;
+const FIVE_HOUR_COUNTDOWN_TOLERANCE_MS = 5 * 60 * 1_000;
+const AUTO_WARMUP_SUCCESS_COOLDOWN_MS = (4 * 60 + 30) * 60 * 1_000;
+const LUNA_MODEL_ID = "gpt-5.6-luna";
 const QUERY_CONCURRENCY = 2;
 
 type SelectionEntryData = {
@@ -49,6 +65,9 @@ type SelectionEntryData = {
 export default function codexAccountExtension(pi: ExtensionAPI) {
   let settings: UsageSettings = { version: 1, hiddenAccounts: [] };
   let usages = new Map<string, AccountUsage>();
+  let antigravityUsage: AntigravityUsageState = { kind: "unconfigured" };
+  let antigravityGeneration = 0;
+  let lastAntigravityQueryAt = 0;
   let sessionActive = false;
   let sessionAccount: string | undefined;
   let authFailed = false;
@@ -56,6 +75,7 @@ export default function codexAccountExtension(pi: ExtensionAPI) {
   let queryController: AbortController | undefined;
   let refreshTimer: ReturnType<typeof setTimeout> | undefined;
   let countdownTimer: ReturnType<typeof setInterval> | undefined;
+  let autoWarmupRunning = false;
   let generation = 0;
   const sessionAuth = new CodexSessionAuth();
 
@@ -71,10 +91,48 @@ export default function codexAccountExtension(pi: ExtensionAPI) {
     const segments = sortUsages(visibleUsages, sessionAccount).map((usage) =>
       formatStatusSegment(usage, sessionAccount, ctx.ui.theme),
     );
+    const geminiIsActive =
+      ctx.model?.provider === "antigravity" && /gemini/iu.test(ctx.model.id);
+    const antigravitySegment = formatAntigravityStatus(
+      antigravityUsage,
+      geminiIsActive,
+      ctx.ui.theme,
+    );
+    if (antigravitySegment) {
+      if (geminiIsActive) segments.unshift(antigravitySegment);
+      else segments.push(antigravitySegment);
+    }
     ctx.ui.setStatus(
       STATUS_KEY,
       segments.length > 0 ? segments.join("  │  ") : undefined,
     );
+
+    // RPC 客户端可以用结构化数据绘制原生账户卡片；TUI 继续使用上面的
+    // 彩色单行状态，因此扩展同时兼容两种界面而不改变终端体验。
+    if (ctx.mode === "rpc") {
+      const hidden = new Set(settings.hiddenAccounts);
+      ctx.ui.setStatus(
+        GUI_STATUS_KEY,
+        JSON.stringify({
+          version: 1,
+          activeAccount: sessionAccount,
+          defaultAccount: state.activeAccount,
+          updatedAt: Date.now(),
+          gemini: antigravityGUIStatus(antigravityUsage, geminiIsActive),
+          accounts: state.accounts.map((account) => {
+            const usage = usages.get(account.name);
+            return {
+              name: account.name,
+              hidden: hidden.has(account.name),
+              capturedAt: usage?.capturedAt,
+              primary: usage?.primary,
+              secondary: usage?.secondary,
+              error: usage?.error,
+            };
+          }),
+        }),
+      );
+    }
   };
 
   const scheduleRefresh = (ctx: ExtensionContext) => {
@@ -87,7 +145,7 @@ export default function codexAccountExtension(pi: ExtensionAPI) {
   };
 
   // 多账户查询需要限制并发、隔离单个账户失败，并防止旧会话结果覆盖新会话状态。
-  const refreshAll = async (ctx: ExtensionContext, notify: boolean) => {
+  const refreshCodexUsage = async (ctx: ExtensionContext, notify: boolean) => {
     const state = safeReadAccountState(ctx);
     if (!state) return;
     const visible = visibleAccounts(state.accounts, settings);
@@ -119,12 +177,141 @@ export default function codexAccountExtension(pi: ExtensionAPI) {
 
     usages = new Map(results.map((usage) => [usage.accountName, usage]));
     publishStatus(ctx);
+    await runAutoWarmupCheck(ctx, visible);
     scheduleRefresh(ctx);
     if (notify) {
       ctx.ui.notify(
         formatUsageSummary(sortUsages(results, sessionAccount), sessionAccount),
         "info",
       );
+    }
+  };
+
+  const refreshAntigravityUsage = async (
+    ctx: ExtensionContext,
+    force: boolean,
+  ) => {
+    const now = Date.now();
+    if (
+      !force &&
+      now - lastAntigravityQueryAt < ANTIGRAVITY_QUERY_INTERVAL_MS
+    ) {
+      publishStatus(ctx);
+      return;
+    }
+
+    const signal = sessionController?.signal;
+    if (!signal) return;
+    lastAntigravityQueryAt = now;
+    const currentGeneration = ++antigravityGeneration;
+    const next = await queryAntigravityUsage(ctx, signal);
+    if (
+      !sessionActive ||
+      signal.aborted ||
+      currentGeneration !== antigravityGeneration
+    ) {
+      return;
+    }
+    antigravityUsage = next;
+    publishStatus(ctx);
+  };
+
+  // 两类额度并行刷新；Antigravity 始终由 publishStatus 追加到 Codex 账户之后。
+  const refreshAll = async (ctx: ExtensionContext, notify: boolean) => {
+    await Promise.all([
+      refreshCodexUsage(ctx, notify),
+      refreshAntigravityUsage(ctx, notify),
+    ]);
+  };
+
+  /**
+   * 每次 Codex 额度刷新后检查可见账户；首次发现完整的 5h 窗口时原子领取，
+   * 成功发送后的 4.5 小时内不再领取，再用 Luna(low) 发送“你好”启动倒计时。
+   */
+  const runAutoWarmupCheck = async (
+    ctx: ExtensionContext,
+    accounts: readonly CodexAccount[],
+  ) => {
+    if (autoWarmupRunning) return;
+    autoWarmupRunning = true;
+    try {
+      const candidates = accounts.flatMap((account) => {
+        const usage = usages.get(account.name);
+        if (!usage) return [];
+        const windowResetAt = unusedFiveHourWindowResetAt(usage);
+        return windowResetAt === undefined ? [] : [{ account, windowResetAt }];
+      });
+      if (candidates.length === 0) return;
+
+      const signal = sessionController?.signal;
+      if (!signal) return;
+      const results = (
+        await Promise.all(
+          candidates.map(async ({ account, windowResetAt }) => {
+            if (
+              !(await claimAutoWarmupWindow(
+                account.name,
+                windowResetAt,
+                Date.now(),
+                AUTO_WARMUP_SUCCESS_COOLDOWN_MS,
+              ))
+            ) {
+              return undefined;
+            }
+            try {
+              await warmupCodexAccount(ctx, account, signal);
+              return { accountName: account.name, error: undefined };
+            } catch (error) {
+              return {
+                accountName: account.name,
+                error: safeProviderErrorMessage(error),
+              };
+            }
+          }),
+        )
+      ).filter((result) => result !== undefined);
+      if (!sessionActive || signal.aborted || results.length === 0) return;
+
+      const records: AutoWarmupRecord[] = results.map((result) => ({
+        timestamp: Date.now(),
+        accountName: result.accountName,
+        status: result.error === undefined ? "success" : "failed",
+        error: result.error,
+      }));
+      try {
+        await appendAutoWarmupRecords(records);
+      } catch (error) {
+        ctx.ui.notify(
+          `保存自动启动记录失败：${errorMessage(error)}`,
+          "warning",
+        );
+      }
+
+      const succeeded = results
+        .filter((result) => result.error === undefined)
+        .map((result) => result.accountName);
+      const failed = results.filter((result) => result.error !== undefined);
+      if (succeeded.length > 0) {
+        ctx.ui.notify(
+          `已用 Luna(low) 向 ${succeeded.join("、")} 发送“你好”，启动 5h 倒计时。`,
+          "info",
+        );
+      }
+      for (const result of failed) {
+        ctx.ui.notify(
+          `账户 ${result.accountName} 自动启动倒计时失败：${result.error}`,
+          "warning",
+        );
+      }
+    } catch (error) {
+      if (sessionActive) {
+        ctx.ui.notify(
+          `自动检查 Codex 账户失败：${errorMessage(error)}`,
+          "warning",
+        );
+      }
+    } finally {
+      autoWarmupRunning = false;
     }
   };
 
@@ -245,6 +432,15 @@ export default function codexAccountExtension(pi: ExtensionAPI) {
     ctx.ui.notify(`账户 ${selected} 已删除。`, "info");
   };
 
+  const showAutoWarmupRecords = async (ctx: ExtensionContext) => {
+    try {
+      const records = await readAutoWarmupRecords();
+      ctx.ui.notify(formatAutoWarmupRecords(records), "info");
+    } catch (error) {
+      ctx.ui.notify(`读取自动启动记录失败：${errorMessage(error)}`, "error");
+    }
+  };
+
   const openAccountsMenu = async (ctx: ExtensionCommandContext) => {
     while (true) {
       const state = safeReadAccountState(ctx);
@@ -268,6 +464,7 @@ export default function codexAccountExtension(pi: ExtensionAPI) {
           "登录新账户",
           "删除账户",
           "额度显示设置",
+          "自动启动记录",
           "关闭",
         ],
       );
@@ -285,12 +482,16 @@ export default function codexAccountExtension(pi: ExtensionAPI) {
               : account.name,
           ),
         );
-        if (selected) await switchAccount(ctx, selected.replace(/^✓\s+/u, ""));
+        if (selected) {
+          await switchAccount(ctx, selected.replace(/^✓\s+/u, ""));
+          return;
+        }
       }
       if (action === "刷新额度") await refreshAll(ctx, true);
       if (action === "登录新账户") await loginAccount(ctx);
       if (action === "删除账户") await deleteAccount(ctx);
       if (action === "额度显示设置") await openVisibilitySettings(ctx);
+      if (action === "自动启动记录") await showAutoWarmupRecords(ctx);
     }
   };
 
@@ -298,6 +499,26 @@ export default function codexAccountExtension(pi: ExtensionAPI) {
     const state = safeReadAccountState(ctx);
     if (!state || state.accounts.length === 0) return;
     const hidden = new Set(settings.hiddenAccounts);
+
+    // custom() 只属于 TUI；RPC/GUI 使用标准 select 协议，客户端会显示原生对话框。
+    if (ctx.mode !== "tui") {
+      const selected = await ctx.ui.select(
+        "选择要显示或隐藏额度的账户",
+        state.accounts.map(
+          (account) =>
+            `${hidden.has(account.name) ? "○" : "✓"} ${account.name}`,
+        ),
+      );
+      if (!selected) return;
+      const accountName = selected.replace(/^[○✓]\s+/u, "");
+      if (hidden.has(accountName)) hidden.delete(accountName);
+      else hidden.add(accountName);
+      settings = { version: 1, hiddenAccounts: [...hidden].sort() };
+      writeSettings(settings);
+      if (hidden.has(accountName)) usages.delete(accountName);
+      await refreshAll(ctx, false);
+      return;
+    }
 
     await ctx.ui.custom<void>((tui, theme, _keybindings, done) => {
       const items: SettingItem[] = state.accounts.map((account) => ({
@@ -354,7 +575,21 @@ export default function codexAccountExtension(pi: ExtensionAPI) {
 
   pi.registerCommand("accounts", {
     description: "管理、登录和切换 OpenAI Codex 账户",
-    handler: async (_args, ctx) => openAccountsMenu(ctx),
+    handler: async (args, ctx) => {
+      const match = args.trim().match(/^switch\s+([A-Za-z0-9._-]{1,64})$/u);
+      if (match?.[1]) {
+        const state = safeReadAccountState(ctx);
+        if (!state) return;
+        requireExistingAccount(state, match[1]);
+        await switchAccount(ctx, match[1]);
+        return;
+      }
+      if (args.trim()) {
+        ctx.ui.notify("用法：/accounts [switch <账户名>]", "warning");
+        return;
+      }
+      await openAccountsMenu(ctx);
+    },
   });
 
   pi.registerCommand("usage", {
@@ -369,6 +604,10 @@ export default function codexAccountExtension(pi: ExtensionAPI) {
         await openVisibilitySettings(ctx);
         return;
       }
+      if (action === "history") {
+        await showAutoWarmupRecords(ctx);
+        return;
+      }
       if (action === "show") {
         await refreshAll(ctx, false);
         ctx.ui.notify(
@@ -381,7 +620,10 @@ export default function codexAccountExtension(pi: ExtensionAPI) {
         return;
       }
       if (action) {
-        ctx.ui.notify("用法：/usage [refresh|settings|show]", "warning");
+        ctx.ui.notify(
+          "用法：/usage [refresh|settings|history|show]",
+          "warning",
+        );
         return;
       }
       await refreshAll(ctx, false);
@@ -448,6 +690,10 @@ export default function codexAccountExtension(pi: ExtensionAPI) {
     await refreshAll(ctx, false);
   });
 
+  pi.on("model_select", (_event, ctx) => {
+    publishStatus(ctx);
+  });
+
   pi.on("before_agent_start", async (_event, ctx) => {
     if (ctx.model?.provider !== PROVIDER_ID) return;
     if (!sessionAccount) {
@@ -473,6 +719,9 @@ export default function codexAccountExtension(pi: ExtensionAPI) {
   pi.on("session_shutdown", async (_event, ctx) => {
     sessionActive = false;
     generation += 1;
+    antigravityGeneration += 1;
+    antigravityUsage = { kind: "unconfigured" };
+    lastAntigravityQueryAt = 0;
     sessionController?.abort();
     sessionController = undefined;
     queryController?.abort();
@@ -483,6 +732,7 @@ export default function codexAccountExtension(pi: ExtensionAPI) {
     countdownTimer = undefined;
     await sessionAuth.clear(ctx);
     ctx.ui.setStatus(STATUS_KEY, undefined);
+    if (ctx.mode === "rpc") ctx.ui.setStatus(GUI_STATUS_KEY, undefined);
   });
 }
 
@@ -502,11 +752,13 @@ async function restoreModelForNewSession(
     return;
   }
 
-  const handoff = [...entries].reverse().find(
-    (entry) =>
-      entry.type === "custom" &&
-      entry.customType === MODEL_HANDOFF_ENTRY_TYPE,
-  );
+  const handoff = [...entries]
+    .reverse()
+    .find(
+      (entry) =>
+        entry.type === "custom" &&
+        entry.customType === MODEL_HANDOFF_ENTRY_TYPE,
+    );
   const data = handoff?.type === "custom" ? asRecord(handoff.data) : undefined;
   const provider = data?.provider;
   const modelId = data?.modelId;
@@ -517,13 +769,19 @@ async function restoreModelForNewSession(
 
   const model = ctx.modelRegistry.find(provider, modelId);
   if (!model) {
-    ctx.ui.notify(`上一个会话使用的模型 ${provider}/${modelId} 当前不可用。`, "warning");
+    ctx.ui.notify(
+      `上一个会话使用的模型 ${provider}/${modelId} 当前不可用。`,
+      "warning",
+    );
     return;
   }
   if (ctx.model?.provider === provider && ctx.model.id === modelId) return;
 
   if (!(await pi.setModel(model))) {
-    ctx.ui.notify(`无法恢复模型 ${provider}/${modelId}：未配置认证。`, "warning");
+    ctx.ui.notify(
+      `无法恢复模型 ${provider}/${modelId}：未配置认证。`,
+      "warning",
+    );
   }
 }
 
@@ -579,6 +837,62 @@ function requireExistingAccount(
 ): void {
   if (!state.accounts.some((account) => account.name === accountName)) {
     throw new Error(`当前会话绑定的 Codex 账户 ${accountName} 不存在。`);
+  }
+}
+
+function unusedFiveHourWindowResetAt(usage: AccountUsage): number | undefined {
+  const window = usage.primary;
+  if (
+    usage.error !== undefined ||
+    window === undefined ||
+    window.remainingPercent !== 100 ||
+    window.windowSeconds !== FIVE_HOUR_WINDOW_SECONDS ||
+    window.resetAt === undefined
+  ) {
+    return undefined;
+  }
+
+  const countdownMs = window.resetAt * 1_000 - usage.capturedAt;
+  const isFreshWindow =
+    countdownMs >=
+      FIVE_HOUR_WINDOW_SECONDS * 1_000 - FIVE_HOUR_COUNTDOWN_TOLERANCE_MS &&
+    countdownMs <=
+      FIVE_HOUR_WINDOW_SECONDS * 1_000 + FIVE_HOUR_COUNTDOWN_TOLERANCE_MS;
+  return isFreshWindow ? window.resetAt : undefined;
+}
+
+async function warmupCodexAccount(
+  ctx: ExtensionContext,
+  account: CodexAccount,
+  signal: AbortSignal,
+): Promise<void> {
+  signal.throwIfAborted();
+  const model = ctx.modelRegistry.find(PROVIDER_ID, LUNA_MODEL_ID);
+  if (!model) throw new Error(`模型 ${PROVIDER_ID}/${LUNA_MODEL_ID} 不可用。`);
+  const provider = ctx.modelRegistry.getProvider(PROVIDER_ID);
+  if (!provider) throw new Error("OpenAI Codex provider 不可用。");
+
+  const response = await provider
+    .streamSimple(
+      model,
+      {
+        messages: [{ role: "user", content: "你好", timestamp: Date.now() }],
+      },
+      {
+        apiKey: account.credential.access,
+        reasoning: "low",
+        toolChoice: "none",
+        maxTokens: 64,
+        timeoutMs: 60_000,
+        transport: "sse",
+        signal,
+      },
+    )
+    .result();
+  if (response.stopReason === "error" || response.stopReason === "aborted") {
+    throw new Error(
+      response.errorMessage ?? `请求以 ${response.stopReason} 结束。`,
+    );
   }
 }
 
@@ -642,6 +956,28 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
   return typeof value === "object" && value !== null && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : undefined;
+}
+
+function formatAutoWarmupRecords(records: readonly AutoWarmupRecord[]): string {
+  if (records.length === 0) return "暂无自动启动记录。";
+  const latest = records.slice(-20).reverse();
+  return [
+    `最近 ${latest.length} 条自动启动记录：`,
+    ...latest.map((record) => {
+      const time = new Date(record.timestamp).toLocaleString("zh-CN", {
+        hour12: false,
+      });
+      return record.status === "success"
+        ? `${time}  ${record.accountName}  已发送“你好”`
+        : `${time}  ${record.accountName}  发送失败：${record.error}`;
+    }),
+  ].join("\n");
+}
+
+function safeProviderErrorMessage(error: unknown): string {
+  return errorMessage(error)
+    .replace(/Bearer\s+\S+/giu, "Bearer [REDACTED]")
+    .slice(0, 200);
 }
 
 function errorMessage(error: unknown): string {

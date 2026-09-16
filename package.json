@@ -1,16 +1,54 @@
 {
-  "name": "pi-codex-account-usage-local",
+  "name": "account-usage",
   "version": "1.0.0",
-  "private": true,
+  "description": "Codex multi-account management and Gemini quota display for Pi Coding Agent",
+  "license": "MIT",
+  "author": "TianYa-Q",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/TianYa-Q/account-usage.git"
+  },
+  "homepage": "https://github.com/TianYa-Q/account-usage#readme",
+  "bugs": {
+    "url": "https://github.com/TianYa-Q/account-usage/issues"
+  },
   "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "codex",
+    "gemini",
+    "account-usage"
+  ],
+  "files": [
+    "*.ts",
+    "antigravity-runtime.js",
+    "LICENSE",
+    "README.md"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
   "scripts": {
     "format": "prettier --write '*.ts' package.json tsconfig.json",
     "format:check": "prettier --check '*.ts' package.json tsconfig.json",
     "typecheck": "tsc --noEmit",
-    "lint": "oxlint . --ignore-pattern node_modules"
+    "lint": "oxlint . --ignore-pattern node_modules",
+    "prepublishOnly": "npm run typecheck && npm run lint && npm run format:check"
   },
   "dependencies": {
+    "pi-antigravity": "0.7.2",
     "proper-lockfile": "4.1.2"
+  },
+  "bundledDependencies": [
+    "pi-antigravity"
+  ],
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
   },
   "devDependencies": {
     "@earendil-works/pi-ai": "0.84.4",

@@ -30,3 +30,10 @@ export type UsageSettings = {
   version: 1;
   hiddenAccounts: string[];
 };
+
+export type AutoWarmupRecord = {
+  timestamp: number;
+  accountName: string;
+  status: "success" | "failed";
+  error: string | undefined;
+};

@@ -17,11 +17,19 @@ import { dirname, join } from "node:path";
 import type { OAuthCredential } from "@earendil-works/pi-ai";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import lockfile from "proper-lockfile";
-import type { CodexAccountState, UsageSettings } from "./types.js";
+import type {
+  AutoWarmupRecord,
+  CodexAccountState,
+  UsageSettings,
+} from "./types.js";
 
 const STORE_PATH = join(getAgentDir(), "codex-accounts.json");
 const LEGACY_ACCOUNTS_PATH = join(getAgentDir(), "pi-accounts.json");
 const SETTINGS_PATH = join(getAgentDir(), "codex-account-usage.json");
+const AUTO_WARMUP_STATE_PATH = join(
+  getAgentDir(),
+  "codex-account-auto-warmup.json",
+);
 const ACCOUNT_NAME_RE = /^[A-Za-z0-9._-]{1,64}$/u;
 
 type StoreDocument = {
@@ -29,6 +37,16 @@ type StoreDocument = {
   active?: string;
   accounts: Record<string, OAuthCredential>;
 };
+
+type AutoWarmupState = {
+  version: 1;
+  claimedWindowResetAtByAccount: Record<string, number>;
+  claimedAtByAccount: Record<string, number>;
+  records: AutoWarmupRecord[];
+};
+
+const MAX_AUTO_WARMUP_RECORDS = 100;
+const AUTO_WARMUP_CLAIM_LEASE_MS = 2 * 60 * 1_000;
 
 export function readCodexAccountState(): CodexAccountState {
   return withStoreLock((document) => ({
@@ -117,6 +135,91 @@ export function writeSettings(settings: UsageSettings): void {
   writePrivateJson(SETTINGS_PATH, normalized);
 }
 
+/** 多个 Pi 进程原子领取额度窗口，并阻止成功发送后的短时间重复唤醒。 */
+export async function claimAutoWarmupWindow(
+  accountName: string,
+  windowResetAt: number,
+  now: number,
+  successfulCooldownMs: number,
+): Promise<boolean> {
+  validateAccountName(accountName);
+  if (!Number.isFinite(windowResetAt) || windowResetAt <= 0) {
+    throw new Error("自动唤醒窗口重置时间无效。");
+  }
+  if (
+    !Number.isFinite(now) ||
+    now < 0 ||
+    !Number.isFinite(successfulCooldownMs) ||
+    successfulCooldownMs <= 0
+  ) {
+    throw new Error("自动唤醒冷却时间参数无效。");
+  }
+
+  const release = await acquirePathLock(AUTO_WARMUP_STATE_PATH);
+  try {
+    const state = readAutoWarmupState();
+    const hasRecentSuccess = state.records.some(
+      (record) =>
+        record.accountName === accountName &&
+        record.status === "success" &&
+        now - record.timestamp < successfulCooldownMs,
+    );
+    const claimedResetAt = state.claimedWindowResetAtByAccount[accountName];
+    const claimedAt = state.claimedAtByAccount[accountName];
+    const hasLiveClaim =
+      claimedAt !== undefined && now - claimedAt < AUTO_WARMUP_CLAIM_LEASE_MS;
+    if (
+      hasRecentSuccess ||
+      hasLiveClaim ||
+      (claimedResetAt !== undefined && claimedResetAt >= windowResetAt)
+    ) {
+      return false;
+    }
+    writePrivateJson(AUTO_WARMUP_STATE_PATH, {
+      ...state,
+      claimedWindowResetAtByAccount: {
+        ...state.claimedWindowResetAtByAccount,
+        [accountName]: windowResetAt,
+      },
+      claimedAtByAccount: {
+        ...state.claimedAtByAccount,
+        [accountName]: now,
+      },
+    } satisfies AutoWarmupState);
+    return true;
+  } finally {
+    await release();
+  }
+}
+
+export async function appendAutoWarmupRecords(
+  records: readonly AutoWarmupRecord[],
+): Promise<void> {
+  if (records.length === 0) return;
+  const normalized = records.map(validateAutoWarmupRecord);
+  const release = await acquirePathLock(AUTO_WARMUP_STATE_PATH);
+  try {
+    const state = readAutoWarmupState();
+    writePrivateJson(AUTO_WARMUP_STATE_PATH, {
+      ...state,
+      records: [...state.records, ...normalized].slice(
+        -MAX_AUTO_WARMUP_RECORDS,
+      ),
+    } satisfies AutoWarmupState);
+  } finally {
+    await release();
+  }
+}
+
+export async function readAutoWarmupRecords(): Promise<AutoWarmupRecord[]> {
+  const release = await acquirePathLock(AUTO_WARMUP_STATE_PATH);
+  try {
+    return readAutoWarmupState().records.map((record) => ({ ...record }));
+  } finally {
+    await release();
+  }
+}
+
 async function updateStore(
   mutate: (document: StoreDocument) => void,
 ): Promise<void> {
@@ -141,8 +244,12 @@ function withStoreLock<T>(reader: (document: StoreDocument) => T): T {
 }
 
 async function acquireStoreLock(): Promise<() => Promise<void>> {
+  return acquirePathLock(STORE_PATH);
+}
+
+async function acquirePathLock(path: string): Promise<() => Promise<void>> {
   ensureStoreParent();
-  return lockfile.lock(STORE_PATH, {
+  return lockfile.lock(path, {
     realpath: false,
     retries: { retries: 8, factor: 2, minTimeout: 50, maxTimeout: 1_000 },
   });
@@ -185,6 +292,90 @@ function readLegacyStore(): StoreDocument {
 
 function parseStoreDocument(raw: string): StoreDocument {
   return normalizeStoreDocument(parseJson(raw));
+}
+
+function readAutoWarmupState(): AutoWarmupState {
+  try {
+    const value = parseJson(readPrivateRegularFile(AUTO_WARMUP_STATE_PATH));
+    if (
+      !isRecord(value) ||
+      value.version !== 1 ||
+      (value.claimedWindowResetAtByAccount !== undefined &&
+        !isRecord(value.claimedWindowResetAtByAccount)) ||
+      (value.claimedAtByAccount !== undefined &&
+        !isRecord(value.claimedAtByAccount)) ||
+      (value.records !== undefined && !Array.isArray(value.records))
+    ) {
+      throw new Error("codex-account-auto-warmup.json 数据结构无效。");
+    }
+    const claimedWindowResetAtByAccount = parseAccountTimestamps(
+      value.claimedWindowResetAtByAccount,
+      "自动唤醒窗口记录",
+    );
+    const claimedAtByAccount = parseAccountTimestamps(
+      value.claimedAtByAccount,
+      "自动唤醒领取记录",
+    );
+    return {
+      version: 1,
+      claimedWindowResetAtByAccount,
+      claimedAtByAccount,
+      records: (value.records ?? []).map(validateAutoWarmupRecord),
+    };
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") {
+      return {
+        version: 1,
+        claimedWindowResetAtByAccount: {},
+        claimedAtByAccount: {},
+        records: [],
+      };
+    }
+    throw error;
+  }
+}
+
+function parseAccountTimestamps(
+  value: unknown,
+  label: string,
+): Record<string, number> {
+  if (value === undefined) return {};
+  if (!isRecord(value)) throw new Error(`${label}无效。`);
+
+  const timestamps: Record<string, number> = {};
+  for (const [accountName, timestamp] of Object.entries(value)) {
+    validateAccountName(accountName);
+    if (
+      typeof timestamp !== "number" ||
+      !Number.isFinite(timestamp) ||
+      timestamp <= 0
+    ) {
+      throw new Error(`${label}无效。`);
+    }
+    timestamps[accountName] = timestamp;
+  }
+  return timestamps;
+}
+
+function validateAutoWarmupRecord(value: unknown): AutoWarmupRecord {
+  if (
+    !isRecord(value) ||
+    typeof value.timestamp !== "number" ||
+    !Number.isFinite(value.timestamp) ||
+    value.timestamp < 0 ||
+    typeof value.accountName !== "string" ||
+    (value.status !== "success" && value.status !== "failed") ||
+    (value.error !== undefined && typeof value.error !== "string")
+  ) {
+    throw new Error("自动启动记录数据无效。");
+  }
+  validateAccountName(value.accountName);
+  return {
+    timestamp: value.timestamp,
+    accountName: value.accountName,
+    status: value.status,
+    error: value.error,
+  };
 }
 
 function normalizeStoreDocument(value: unknown): StoreDocument {
