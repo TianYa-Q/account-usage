@@ -48,6 +48,11 @@ type AutoWarmupState = {
 const MAX_AUTO_WARMUP_RECORDS = 100;
 const AUTO_WARMUP_CLAIM_LEASE_MS = 2 * 60 * 1_000;
 
+type AsyncLockLease = {
+  release(): Promise<void>;
+  throwIfCompromised(): void;
+};
+
 export function readCodexAccountState(): CodexAccountState {
   return withStoreLock((document) => ({
     accounts: Object.entries(document.accounts)
@@ -101,17 +106,18 @@ export async function refreshStoredCredential(
   refresh: (credential: OAuthCredential) => Promise<OAuthCredential>,
 ): Promise<OAuthCredential> {
   validateAccountName(accountName);
-  const release = await acquireStoreLock();
+  const lease = await acquireStoreLock();
   try {
     const document = readStoreDocument();
     const current = document.accounts[accountName];
     if (!current) throw new Error(`Codex 账户 ${accountName} 不存在。`);
     const refreshed = validateCredential(await refresh(current), accountName);
+    lease.throwIfCompromised();
     document.accounts[accountName] = refreshed;
     writePrivateJson(STORE_PATH, document);
     return structuredClone(refreshed);
   } finally {
-    await release();
+    await lease.release();
   }
 }
 
@@ -155,7 +161,7 @@ export async function claimAutoWarmupWindow(
     throw new Error("自动唤醒冷却时间参数无效。");
   }
 
-  const release = await acquirePathLock(AUTO_WARMUP_STATE_PATH);
+  const lease = await acquirePathLock(AUTO_WARMUP_STATE_PATH);
   try {
     const state = readAutoWarmupState();
     const hasRecentSuccess = state.records.some(
@@ -175,6 +181,7 @@ export async function claimAutoWarmupWindow(
     ) {
       return false;
     }
+    lease.throwIfCompromised();
     writePrivateJson(AUTO_WARMUP_STATE_PATH, {
       ...state,
       claimedWindowResetAtByAccount: {
@@ -188,7 +195,7 @@ export async function claimAutoWarmupWindow(
     } satisfies AutoWarmupState);
     return true;
   } finally {
-    await release();
+    await lease.release();
   }
 }
 
@@ -197,9 +204,10 @@ export async function appendAutoWarmupRecords(
 ): Promise<void> {
   if (records.length === 0) return;
   const normalized = records.map(validateAutoWarmupRecord);
-  const release = await acquirePathLock(AUTO_WARMUP_STATE_PATH);
+  const lease = await acquirePathLock(AUTO_WARMUP_STATE_PATH);
   try {
     const state = readAutoWarmupState();
+    lease.throwIfCompromised();
     writePrivateJson(AUTO_WARMUP_STATE_PATH, {
       ...state,
       records: [...state.records, ...normalized].slice(
@@ -207,29 +215,34 @@ export async function appendAutoWarmupRecords(
       ),
     } satisfies AutoWarmupState);
   } finally {
-    await release();
+    await lease.release();
   }
 }
 
 export async function readAutoWarmupRecords(): Promise<AutoWarmupRecord[]> {
-  const release = await acquirePathLock(AUTO_WARMUP_STATE_PATH);
+  const lease = await acquirePathLock(AUTO_WARMUP_STATE_PATH);
   try {
-    return readAutoWarmupState().records.map((record) => ({ ...record }));
+    const records = readAutoWarmupState().records.map((record) => ({
+      ...record,
+    }));
+    lease.throwIfCompromised();
+    return records;
   } finally {
-    await release();
+    await lease.release();
   }
 }
 
 async function updateStore(
   mutate: (document: StoreDocument) => void,
 ): Promise<void> {
-  const release = await acquireStoreLock();
+  const lease = await acquireStoreLock();
   try {
     const document = readStoreDocument();
     mutate(document);
+    lease.throwIfCompromised();
     writePrivateJson(STORE_PATH, document);
   } finally {
-    await release();
+    await lease.release();
   }
 }
 
@@ -243,15 +256,40 @@ function withStoreLock<T>(reader: (document: StoreDocument) => T): T {
   }
 }
 
-async function acquireStoreLock(): Promise<() => Promise<void>> {
+async function acquireStoreLock(): Promise<AsyncLockLease> {
   return acquirePathLock(STORE_PATH);
 }
 
-async function acquirePathLock(path: string): Promise<() => Promise<void>> {
+async function acquirePathLock(path: string): Promise<AsyncLockLease> {
   ensureStoreParent();
-  return lockfile.lock(path, {
+  let compromised: Error | undefined;
+  const releaseLock = await lockfile.lock(path, {
     realpath: false,
     retries: { retries: 8, factor: 2, minTimeout: 50, maxTimeout: 1_000 },
+    // The default callback throws from a heartbeat timer and terminates Pi.
+    // Record the failure so the active operation can reject through its promise.
+    onCompromised: (error) => {
+      compromised = compromisedLockError(path, error);
+    },
+  });
+  return {
+    throwIfCompromised() {
+      if (compromised) throw compromised;
+    },
+    async release() {
+      try {
+        if (!compromised) await releaseLock();
+      } catch (error) {
+        if (!compromised) throw error;
+      }
+      if (compromised) throw compromised;
+    },
+  };
+}
+
+function compromisedLockError(path: string, cause: Error): Error {
+  return new Error(`账户数据锁已失效（${path}），已取消本次操作。`, {
+    cause,
   });
 }
 

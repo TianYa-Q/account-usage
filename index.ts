@@ -22,6 +22,7 @@ import { CodexSessionAuth } from "./auth.js";
 import { queryAccountUsage } from "./codex.js";
 import { formatStatusSegment, formatUsageSummary } from "./format.js";
 import { loginCodexAccount } from "./oauth.js";
+import { readThroughSharedCache } from "./shared-cache.js";
 import {
   appendAutoWarmupRecords,
   claimAutoWarmupWindow,
@@ -47,8 +48,8 @@ const SELECTION_ENTRY_TYPE = "codex-account-selection";
 const LEGACY_SELECTION_ENTRY_TYPE = "pi-accounts-selection";
 const MODEL_HANDOFF_ENTRY_TYPE = "model-handoff-on-new-session";
 const PROVIDER_ID = "openai-codex";
-const QUERY_INTERVAL_MS = 60 * 1_000;
-const ANTIGRAVITY_QUERY_INTERVAL_MS = 5 * 60 * 1_000;
+const ACTIVE_QUERY_INTERVAL_MS = 60 * 1_000;
+const IDLE_QUERY_INTERVAL_MS = 3 * 60 * 1_000;
 const COUNTDOWN_INTERVAL_MS = 60 * 1_000;
 const FIVE_HOUR_WINDOW_SECONDS = 5 * 60 * 60;
 const FIVE_HOUR_COUNTDOWN_TOLERANCE_MS = 5 * 60 * 1_000;
@@ -102,13 +103,15 @@ export default function codexAccountExtension(pi: ExtensionAPI) {
       if (geminiIsActive) segments.unshift(antigravitySegment);
       else segments.push(antigravitySegment);
     }
-    ctx.ui.setStatus(
-      STATUS_KEY,
-      segments.length > 0 ? segments.join("  │  ") : undefined,
-    );
+    if (ctx.mode !== "rpc") {
+      ctx.ui.setStatus(
+        STATUS_KEY,
+        segments.length > 0 ? segments.join("  │  ") : undefined,
+      );
+    }
 
-    // RPC 客户端可以用结构化数据绘制原生账户卡片；TUI 继续使用上面的
-    // 彩色单行状态，因此扩展同时兼容两种界面而不改变终端体验。
+    // RPC 客户端可以用结构化数据绘制原生账户卡片；TUI 使用上面的
+    // 彩色单行状态。每种界面只发布自己需要的一种状态，避免重复事件。
     if (ctx.mode === "rpc") {
       const hidden = new Set(settings.hiddenAccounts);
       ctx.ui.setStatus(
@@ -135,12 +138,24 @@ export default function codexAccountExtension(pi: ExtensionAPI) {
     }
   };
 
+  const queryInterval = (ctx: ExtensionContext) =>
+    ctx.isIdle() ? IDLE_QUERY_INTERVAL_MS : ACTIVE_QUERY_INTERVAL_MS;
+
   const scheduleRefresh = (ctx: ExtensionContext) => {
     if (refreshTimer) clearTimeout(refreshTimer);
     refreshTimer = setTimeout(() => {
       refreshTimer = undefined;
-      if (sessionActive) void refreshAll(ctx, false);
-    }, QUERY_INTERVAL_MS);
+      if (sessionActive) {
+        void refreshAll(ctx, false).catch((error) => {
+          if (sessionActive) {
+            ctx.ui.notify(
+              `刷新账户额度失败：${errorMessage(error)}`,
+              "warning",
+            );
+          }
+        });
+      }
+    }, queryInterval(ctx));
     refreshTimer.unref?.();
   };
 
@@ -156,17 +171,24 @@ export default function codexAccountExtension(pi: ExtensionAPI) {
 
     if (visible.length === 0) {
       usages.clear();
-      publishStatus(ctx);
       if (notify) ctx.ui.notify("没有可显示的 Codex 账户。", "info");
-      scheduleRefresh(ctx);
       return;
     }
 
-    const results = await mapWithConcurrency(
-      visible,
-      QUERY_CONCURRENCY,
-      (account) => queryAccountUsage(account, controller.signal),
-    );
+    const results = await readThroughSharedCache({
+      namespace: "codex",
+      key: visible
+        .map((account) => account.name)
+        .sort()
+        .join("\u0000"),
+      maxAgeMs: queryInterval(ctx),
+      force: notify,
+      signal: controller.signal,
+      query: () =>
+        mapWithConcurrency(visible, QUERY_CONCURRENCY, (account) =>
+          queryAccountUsage(account, controller.signal),
+        ),
+    });
     if (
       !sessionActive ||
       controller.signal.aborted ||
@@ -176,9 +198,7 @@ export default function codexAccountExtension(pi: ExtensionAPI) {
     }
 
     usages = new Map(results.map((usage) => [usage.accountName, usage]));
-    publishStatus(ctx);
     await runAutoWarmupCheck(ctx, visible);
-    scheduleRefresh(ctx);
     if (notify) {
       ctx.ui.notify(
         formatUsageSummary(sortUsages(results, sessionAccount), sessionAccount),
@@ -192,19 +212,21 @@ export default function codexAccountExtension(pi: ExtensionAPI) {
     force: boolean,
   ) => {
     const now = Date.now();
-    if (
-      !force &&
-      now - lastAntigravityQueryAt < ANTIGRAVITY_QUERY_INTERVAL_MS
-    ) {
-      publishStatus(ctx);
-      return;
-    }
+    const interval = queryInterval(ctx);
+    if (!force && now - lastAntigravityQueryAt < interval) return;
 
     const signal = sessionController?.signal;
     if (!signal) return;
     lastAntigravityQueryAt = now;
     const currentGeneration = ++antigravityGeneration;
-    const next = await queryAntigravityUsage(ctx, signal);
+    const next = await readThroughSharedCache({
+      namespace: "antigravity",
+      key: "default",
+      maxAgeMs: interval,
+      force,
+      signal,
+      query: () => queryAntigravityUsage(ctx, signal),
+    });
     if (
       !sessionActive ||
       signal.aborted ||
@@ -213,15 +235,23 @@ export default function codexAccountExtension(pi: ExtensionAPI) {
       return;
     }
     antigravityUsage = next;
-    publishStatus(ctx);
   };
 
-  // 两类额度并行刷新；Antigravity 始终由 publishStatus 追加到 Codex 账户之后。
+  // 两类额度并行刷新，完成后只发布一次完整快照。
   const refreshAll = async (ctx: ExtensionContext, notify: boolean) => {
-    await Promise.all([
-      refreshCodexUsage(ctx, notify),
-      refreshAntigravityUsage(ctx, notify),
-    ]);
+    try {
+      await Promise.all([
+        refreshCodexUsage(ctx, notify),
+        refreshAntigravityUsage(ctx, notify),
+      ]);
+      if (sessionActive) publishStatus(ctx);
+    } catch (error) {
+      // A newer refresh or session shutdown deliberately aborts the previous one.
+      // Treat that as normal control flow instead of leaking an unhandled rejection.
+      if (!isAbortError(error)) throw error;
+    } finally {
+      if (sessionActive) scheduleRefresh(ctx);
+    }
   };
 
   /**
@@ -682,11 +712,15 @@ export default function codexAccountExtension(pi: ExtensionAPI) {
 
     await restoreModelForNewSession(pi, event, ctx);
 
-    countdownTimer = setInterval(
-      () => publishStatus(ctx),
-      COUNTDOWN_INTERVAL_MS,
-    );
-    countdownTimer.unref?.();
+    // The native RPC client renders reset countdowns locally. Re-publishing the same
+    // snapshot every minute only creates duplicate extension_ui_request events there.
+    if (ctx.mode !== "rpc") {
+      countdownTimer = setInterval(
+        () => publishStatus(ctx),
+        COUNTDOWN_INTERVAL_MS,
+      );
+      countdownTimer.unref?.();
+    }
     await refreshAll(ctx, false);
   });
 
@@ -706,6 +740,12 @@ export default function codexAccountExtension(pi: ExtensionAPI) {
     } catch (error) {
       ctx.ui.notify(errorMessage(error), "error");
     }
+  });
+
+  pi.on("agent_start", (_event, ctx) => {
+    // A running agent uses the one-minute cadence immediately, even if this timer was
+    // previously scheduled while the session was idle.
+    scheduleRefresh(ctx);
   });
 
   pi.on("turn_start", (_event, ctx) => {
@@ -978,6 +1018,10 @@ function safeProviderErrorMessage(error: unknown): string {
   return errorMessage(error)
     .replace(/Bearer\s+\S+/giu, "Bearer [REDACTED]")
     .slice(0, 200);
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === "AbortError";
 }
 
 function errorMessage(error: unknown): string {

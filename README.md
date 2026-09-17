@@ -36,6 +36,8 @@ pi install git:github.com/TianYa-Q/account-usage
 
 Account credentials and settings remain on the local machine under Pi's agent directory. Credential files are written with owner-only permissions. They are never included in this package.
 
+Quota results are shared by all running Pi sessions through an owner-only local cache. While any agent is running, its session refreshes all Codex accounts and Gemini at most once per minute. Idle sessions refresh at most once every three minutes. Other sessions reuse the shared result instead of repeating provider requests. `/usage refresh` bypasses the cache for an explicit refresh.
+
 When a visible Codex account has a fresh, unused 5-hour window, the extension may send `你好` once with `gpt-5.6-luna` at low thinking level to start that window. Successful warm-ups have a 4.5-hour cooldown and are recorded locally.
 
 Gemini quota display is available when the `antigravity` provider is configured. The package includes the compatible `pi-antigravity` runtime used to query its quota endpoint.
