@@ -130,6 +130,7 @@ export default function codexAccountExtension(pi: ExtensionAPI) {
               capturedAt: usage?.capturedAt,
               primary: usage?.primary,
               secondary: usage?.secondary,
+              resetCredits: usage?.resetCredits,
               error: usage?.error,
             };
           }),

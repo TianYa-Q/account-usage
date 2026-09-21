@@ -18,11 +18,22 @@ export type UsageWindow = {
   windowSeconds: number | undefined;
 };
 
+export type ResetCredit = {
+  expiresAt: number | undefined;
+  title: string | undefined;
+};
+
+export type ResetCredits = {
+  availableCount: number;
+  credits: ResetCredit[];
+};
+
 export type AccountUsage = {
   accountName: string;
   capturedAt: number;
   primary: UsageWindow | undefined;
   secondary: UsageWindow | undefined;
+  resetCredits: ResetCredits | undefined;
   error: string | undefined;
 };
 

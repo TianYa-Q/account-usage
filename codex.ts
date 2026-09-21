@@ -1,9 +1,16 @@
 import type { OAuthCredential } from "@earendil-works/pi-ai";
 import { getCodexOAuth } from "./oauth.js";
 import { refreshStoredCredential } from "./store.js";
-import type { AccountUsage, CodexAccount, UsageWindow } from "./types.js";
+import type {
+  AccountUsage,
+  CodexAccount,
+  ResetCredits,
+  UsageWindow,
+} from "./types.js";
 
 const USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
+const RESET_CREDITS_URL =
+  "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits";
 const REFRESH_SKEW_MS = 5 * 60 * 1_000;
 const REQUEST_TIMEOUT_MS = 15_000;
 const MAX_BODY_BYTES = 64 * 1_024;
@@ -32,6 +39,7 @@ export async function queryAccountUsage(
       capturedAt: Date.now(),
       primary: undefined,
       secondary: undefined,
+      resetCredits: undefined,
       error: safeErrorMessage(error),
     };
   }
@@ -97,16 +105,68 @@ async function requestUsage(
     const secondary = parseWindow(rateLimit.secondary_window);
     if (!primary && !secondary)
       throw new Error("额度接口没有可显示的时间窗口。");
+    const resetCredits = await requestResetCredits(
+      credential,
+      accountId,
+      controller.signal,
+    );
     return {
       accountName,
       capturedAt: Date.now(),
       primary,
       secondary,
+      resetCredits,
       error: undefined,
     };
   } finally {
     clearTimeout(timeout);
     ownerSignal.removeEventListener("abort", abort);
+  }
+}
+
+async function requestResetCredits(
+  credential: OAuthCredential,
+  accountId: string,
+  signal: AbortSignal,
+): Promise<ResetCredits | undefined> {
+  try {
+    const response = await fetch(RESET_CREDITS_URL, {
+      headers: {
+        Authorization: `Bearer ${credential.access}`,
+        "chatgpt-account-id": accountId,
+        "User-Agent": "pi-codex-account-usage",
+      },
+      redirect: "error",
+      signal,
+    });
+    // Reset credits are supplementary. Unsupported plans/endpoints must not hide
+    // otherwise valid usage windows.
+    if (!response.ok) return undefined;
+    const body = await readBoundedJson(response);
+    const rawCount = finiteNumber(body.available_count);
+    if (rawCount === undefined || rawCount < 0) return undefined;
+    const credits = Array.isArray(body.credits)
+      ? body.credits.flatMap((value) => {
+          const credit = asRecord(value);
+          if (!credit || credit.status !== "available") return [];
+          const parsedExpiry =
+            typeof credit.expires_at === "string"
+              ? Date.parse(credit.expires_at)
+              : Number.NaN;
+          return [
+            {
+              expiresAt: Number.isFinite(parsedExpiry)
+                ? parsedExpiry / 1_000
+                : undefined,
+              title:
+                typeof credit.title === "string" ? credit.title : undefined,
+            },
+          ];
+        })
+      : [];
+    return { availableCount: Math.floor(rawCount), credits };
+  } catch {
+    return undefined;
   }
 }
 
