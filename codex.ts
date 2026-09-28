@@ -1,4 +1,5 @@
 import type { OAuthCredential } from "@earendil-works/pi-ai";
+import { logQuotaFailure } from "./diagnostics.js";
 import { getCodexOAuth } from "./oauth.js";
 import { refreshStoredCredential } from "./store.js";
 import type {
@@ -19,6 +20,8 @@ export async function queryAccountUsage(
   account: CodexAccount,
   signal: AbortSignal,
 ): Promise<AccountUsage> {
+  const startedAt = Date.now();
+  let operation = "credential_refresh";
   try {
     let credential = await ensureFreshCredential(
       account.name,
@@ -26,14 +29,28 @@ export async function queryAccountUsage(
       signal,
     );
     try {
+      operation = "usage_request";
       return await requestUsage(account.name, credential, signal);
     } catch (error) {
       if (!(error instanceof HttpStatusError) || error.status !== 401)
         throw error;
+      operation = "credential_refresh_after_401";
       credential = await refreshCredential(account.name, credential, signal);
+      operation = "usage_request_after_401";
       return await requestUsage(account.name, credential, signal);
     }
   } catch (error) {
+    if (!signal.aborted) {
+      logQuotaFailure(
+        {
+          provider: "codex",
+          accountName: account.name,
+          operation,
+          elapsedMs: Date.now() - startedAt,
+        },
+        error,
+      );
+    }
     return {
       accountName: account.name,
       capturedAt: Date.now(),
@@ -106,6 +123,7 @@ async function requestUsage(
     if (!primary && !secondary)
       throw new Error("额度接口没有可显示的时间窗口。");
     const resetCredits = await requestResetCredits(
+      accountName,
       credential,
       accountId,
       controller.signal,
@@ -125,10 +143,12 @@ async function requestUsage(
 }
 
 async function requestResetCredits(
+  accountName: string,
   credential: OAuthCredential,
   accountId: string,
   signal: AbortSignal,
 ): Promise<ResetCredits | undefined> {
+  const startedAt = Date.now();
   try {
     const response = await fetch(RESET_CREDITS_URL, {
       headers: {
@@ -165,7 +185,18 @@ async function requestResetCredits(
         })
       : [];
     return { availableCount: Math.floor(rawCount), credits };
-  } catch {
+  } catch (error) {
+    if (!signal.aborted) {
+      logQuotaFailure(
+        {
+          provider: "codex",
+          accountName,
+          operation: "reset_credits_request",
+          elapsedMs: Date.now() - startedAt,
+        },
+        error,
+      );
+    }
     return undefined;
   }
 }

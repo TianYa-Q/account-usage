@@ -1,5 +1,6 @@
 import type { ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { fetchAccountUsage } from "./antigravity-runtime.js";
+import { logQuotaFailure } from "./diagnostics.js";
 
 export type AntigravityUsageState =
   | { kind: "unconfigured" }
@@ -27,16 +28,23 @@ export async function queryAntigravityUsage(
   ctx: ExtensionContext,
   signal: AbortSignal,
 ): Promise<AntigravityUsageState> {
+  const startedAt = Date.now();
+  let operation = "credential_lookup";
   try {
     signal.throwIfAborted();
     const apiKey = await ctx.modelRegistry.getApiKeyForProvider("antigravity");
     if (!apiKey) return { kind: "unconfigured" };
 
+    operation = "usage_request";
     const usage = parseUsage(await fetchAccountUsage(apiKey));
     signal.throwIfAborted();
     return { kind: "loaded", usage };
   } catch (error) {
     if (signal.aborted) throw error;
+    logQuotaFailure(
+      { provider: "gemini", operation, elapsedMs: Date.now() - startedAt },
+      error,
+    );
     return { kind: "failed", error: safeErrorMessage(error) };
   }
 }

@@ -11,7 +11,7 @@ A [Pi Coding Agent](https://github.com/badlogic/pi-mono) extension for:
 ## Install
 
 ```bash
-pi install git:github.com/TianYa-Q/account-usage@v1.0.0
+pi install git:github.com/TianYa-Q/account-usage@v1.0.3
 ```
 
 Restart Pi after installation. To install the latest unpinned revision instead:
@@ -38,7 +38,9 @@ Account credentials and settings remain on the local machine under Pi's agent di
 
 Quota results are shared by all running Pi sessions through an owner-only local cache. While any agent is running, its session refreshes all Codex accounts and Gemini at most once per minute. Idle sessions refresh at most once every three minutes. Other sessions reuse the shared result instead of repeating provider requests. `/usage refresh` bypasses the cache for an explicit refresh.
 
-When a visible Codex account has a fresh, unused 5-hour window, the extension may send `你好` once with `gpt-5.6-luna` at low thinking level to start that window. Successful warm-ups have a 4.5-hour cooldown and are recorded locally.
+Quota query failures are recorded in `~/.pi/agent/account-usage-errors.jsonl` (with one rotated `.1` backup). Each JSON line includes the time, provider, account name when applicable, request stage, duration, and safe Node error/cause codes (for example `ETIMEDOUT` or `ECONNRESET`). The log is owner-only and excludes credentials, headers, URLs, and response bodies. Restart Pi/Pi Mac after updating the extension so running sessions load this diagnostics code.
+
+When a visible Codex account has a full, unused 5-hour or 7-day window (its reset countdown is within 5 minutes of the full window), the extension may send `你好` with `gpt-5.6-luna` at low thinking level to start the countdown. Both windows are tracked independently; when they refresh together, only one request is sent. Automatic warm-ups have a 10-minute per-window cooldown, so a recent 5-hour warm-up does not block a weekly warm-up. Each window is claimed only once, and warm-ups are recorded locally.
 
 Gemini quota display is available when the `antigravity` provider is configured. The package includes the compatible `pi-antigravity` runtime used to query its quota endpoint.
 

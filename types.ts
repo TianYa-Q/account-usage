@@ -46,5 +46,6 @@ export type AutoWarmupRecord = {
   timestamp: number;
   accountName: string;
   status: "success" | "failed";
+  windowKind?: "5h" | "7d";
   error: string | undefined;
 };

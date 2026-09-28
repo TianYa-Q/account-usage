@@ -20,6 +20,7 @@ import {
 } from "./antigravity.js";
 import { CodexSessionAuth } from "./auth.js";
 import { queryAccountUsage } from "./codex.js";
+import { logQuotaFailure } from "./diagnostics.js";
 import { formatStatusSegment, formatUsageSummary } from "./format.js";
 import { loginCodexAccount } from "./oauth.js";
 import { readThroughSharedCache } from "./shared-cache.js";
@@ -52,8 +53,9 @@ const ACTIVE_QUERY_INTERVAL_MS = 60 * 1_000;
 const IDLE_QUERY_INTERVAL_MS = 3 * 60 * 1_000;
 const COUNTDOWN_INTERVAL_MS = 60 * 1_000;
 const FIVE_HOUR_WINDOW_SECONDS = 5 * 60 * 60;
-const FIVE_HOUR_COUNTDOWN_TOLERANCE_MS = 5 * 60 * 1_000;
-const AUTO_WARMUP_SUCCESS_COOLDOWN_MS = (4 * 60 + 30) * 60 * 1_000;
+const WEEKLY_WINDOW_SECONDS = 7 * 24 * 60 * 60;
+const FRESH_WINDOW_TOLERANCE_MS = 5 * 60 * 1_000;
+const AUTO_WARMUP_SUCCESS_COOLDOWN_MS = 10 * 60 * 1_000;
 const LUNA_MODEL_ID = "gpt-5.6-luna";
 const QUERY_CONCURRENCY = 2;
 
@@ -199,7 +201,7 @@ export default function codexAccountExtension(pi: ExtensionAPI) {
     }
 
     usages = new Map(results.map((usage) => [usage.accountName, usage]));
-    await runAutoWarmupCheck(ctx, visible);
+    await runAutoWarmupCheck(ctx, visible, notify);
     if (notify) {
       ctx.ui.notify(
         formatUsageSummary(sortUsages(results, sessionAccount), sessionAccount),
@@ -240,6 +242,7 @@ export default function codexAccountExtension(pi: ExtensionAPI) {
 
   // 两类额度并行刷新，完成后只发布一次完整快照。
   const refreshAll = async (ctx: ExtensionContext, notify: boolean) => {
+    const startedAt = Date.now();
     try {
       await Promise.all([
         refreshCodexUsage(ctx, notify),
@@ -249,19 +252,30 @@ export default function codexAccountExtension(pi: ExtensionAPI) {
     } catch (error) {
       // A newer refresh or session shutdown deliberately aborts the previous one.
       // Treat that as normal control flow instead of leaking an unhandled rejection.
-      if (!isAbortError(error)) throw error;
+      if (!isAbortError(error)) {
+        logQuotaFailure(
+          {
+            provider: "shared",
+            operation: "refresh_or_shared_cache",
+            elapsedMs: Date.now() - startedAt,
+          },
+          error,
+        );
+        throw error;
+      }
     } finally {
       if (sessionActive) scheduleRefresh(ctx);
     }
   };
 
   /**
-   * 每次 Codex 额度刷新后检查可见账户；首次发现完整的 5h 窗口时原子领取，
-   * 成功发送后的 4.5 小时内不再领取，再用 Luna(low) 发送“你好”启动倒计时。
+   * 每次刷新分别领取刚刷新的 5h / 7d 窗口；同一账户两个窗口同时刷新只发送一次。
+   * 同类窗口成功发送后冷却 10 分钟；5h 与 7d 独立判断，周限额不受 5h 冷却影响。
    */
   const runAutoWarmupCheck = async (
     ctx: ExtensionContext,
     accounts: readonly CodexAccount[],
+    manualRefresh: boolean,
   ) => {
     if (autoWarmupRunning) return;
     autoWarmupRunning = true;
@@ -269,8 +283,16 @@ export default function codexAccountExtension(pi: ExtensionAPI) {
       const candidates = accounts.flatMap((account) => {
         const usage = usages.get(account.name);
         if (!usage) return [];
-        const windowResetAt = unusedFiveHourWindowResetAt(usage);
-        return windowResetAt === undefined ? [] : [{ account, windowResetAt }];
+        const windows = (
+          [
+            ["5h", usage.primary, FIVE_HOUR_WINDOW_SECONDS],
+            ["7d", usage.secondary, WEEKLY_WINDOW_SECONDS],
+          ] as const
+        ).flatMap(([kind, window, seconds]) => {
+          const windowResetAt = freshWindowResetAt(usage, window, seconds);
+          return windowResetAt === undefined ? [] : [{ kind, windowResetAt }];
+        });
+        return windows.length > 0 ? [{ account, windows }] : [];
       });
       if (candidates.length === 0) return;
 
@@ -278,23 +300,33 @@ export default function codexAccountExtension(pi: ExtensionAPI) {
       if (!signal) return;
       const results = (
         await Promise.all(
-          candidates.map(async ({ account, windowResetAt }) => {
-            if (
-              !(await claimAutoWarmupWindow(
-                account.name,
-                windowResetAt,
-                Date.now(),
-                AUTO_WARMUP_SUCCESS_COOLDOWN_MS,
-              ))
-            ) {
-              return undefined;
+          candidates.map(async ({ account, windows }) => {
+            const claimed = [] as Array<(typeof windows)[number]>;
+            for (const window of windows) {
+              if (
+                await claimAutoWarmupWindow(
+                  account.name,
+                  window.windowResetAt,
+                  Date.now(),
+                  AUTO_WARMUP_SUCCESS_COOLDOWN_MS,
+                  manualRefresh,
+                  window.kind,
+                )
+              )
+                claimed.push(window);
             }
+            if (claimed.length === 0) return undefined;
             try {
               await warmupCodexAccount(ctx, account, signal);
-              return { accountName: account.name, error: undefined };
+              return {
+                accountName: account.name,
+                kinds: claimed.map((window) => window.kind),
+                error: undefined,
+              };
             } catch (error) {
               return {
                 accountName: account.name,
+                kinds: claimed.map((window) => window.kind),
                 error: safeProviderErrorMessage(error),
               };
             }
@@ -303,12 +335,18 @@ export default function codexAccountExtension(pi: ExtensionAPI) {
       ).filter((result) => result !== undefined);
       if (!sessionActive || signal.aborted || results.length === 0) return;
 
-      const records: AutoWarmupRecord[] = results.map((result) => ({
-        timestamp: Date.now(),
-        accountName: result.accountName,
-        status: result.error === undefined ? "success" : "failed",
-        error: result.error,
-      }));
+      const records: AutoWarmupRecord[] = results.flatMap((result) =>
+        result.kinds.map((windowKind) => ({
+          timestamp: Date.now(),
+          accountName: result.accountName,
+          windowKind,
+          status:
+            result.error === undefined
+              ? ("success" as const)
+              : ("failed" as const),
+          error: result.error,
+        })),
+      );
       try {
         await appendAutoWarmupRecords(records);
       } catch (error) {
@@ -320,11 +358,11 @@ export default function codexAccountExtension(pi: ExtensionAPI) {
 
       const succeeded = results
         .filter((result) => result.error === undefined)
-        .map((result) => result.accountName);
+        .map((result) => `${result.accountName}（${result.kinds.join("、")}）`);
       const failed = results.filter((result) => result.error !== undefined);
       if (succeeded.length > 0) {
         ctx.ui.notify(
-          `已用 Luna(low) 向 ${succeeded.join("、")} 发送“你好”，启动 5h 倒计时。`,
+          `已用 Luna(low) 向 ${succeeded.join("、")} 发送“你好”，启动额度倒计时。`,
           "info",
         );
       }
@@ -881,13 +919,16 @@ function requireExistingAccount(
   }
 }
 
-function unusedFiveHourWindowResetAt(usage: AccountUsage): number | undefined {
-  const window = usage.primary;
+function freshWindowResetAt(
+  usage: AccountUsage,
+  window: AccountUsage["primary"],
+  windowSeconds: number,
+): number | undefined {
   if (
     usage.error !== undefined ||
     window === undefined ||
     window.remainingPercent !== 100 ||
-    window.windowSeconds !== FIVE_HOUR_WINDOW_SECONDS ||
+    window.windowSeconds !== windowSeconds ||
     window.resetAt === undefined
   ) {
     return undefined;
@@ -895,10 +936,8 @@ function unusedFiveHourWindowResetAt(usage: AccountUsage): number | undefined {
 
   const countdownMs = window.resetAt * 1_000 - usage.capturedAt;
   const isFreshWindow =
-    countdownMs >=
-      FIVE_HOUR_WINDOW_SECONDS * 1_000 - FIVE_HOUR_COUNTDOWN_TOLERANCE_MS &&
-    countdownMs <=
-      FIVE_HOUR_WINDOW_SECONDS * 1_000 + FIVE_HOUR_COUNTDOWN_TOLERANCE_MS;
+    countdownMs >= windowSeconds * 1_000 - FRESH_WINDOW_TOLERANCE_MS &&
+    countdownMs <= windowSeconds * 1_000 + FRESH_WINDOW_TOLERANCE_MS;
   return isFreshWindow ? window.resetAt : undefined;
 }
 
@@ -1009,8 +1048,8 @@ function formatAutoWarmupRecords(records: readonly AutoWarmupRecord[]): string {
         hour12: false,
       });
       return record.status === "success"
-        ? `${time}  ${record.accountName}  已发送“你好”`
-        : `${time}  ${record.accountName}  发送失败：${record.error}`;
+        ? `${time}  ${record.accountName}（${record.windowKind ?? "5h"}）  已发送“你好”`
+        : `${time}  ${record.accountName}（${record.windowKind ?? "5h"}）  发送失败：${record.error}`;
     }),
   ].join("\n");
 }

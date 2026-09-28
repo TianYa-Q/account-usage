@@ -42,6 +42,8 @@ type AutoWarmupState = {
   version: 1;
   claimedWindowResetAtByAccount: Record<string, number>;
   claimedAtByAccount: Record<string, number>;
+  weeklyClaimedWindowResetAtByAccount: Record<string, number>;
+  weeklyClaimedAtByAccount: Record<string, number>;
   records: AutoWarmupRecord[];
 };
 
@@ -147,6 +149,8 @@ export async function claimAutoWarmupWindow(
   windowResetAt: number,
   now: number,
   successfulCooldownMs: number,
+  bypassSuccessCooldown = false,
+  windowKind: "5h" | "7d" = "5h",
 ): Promise<boolean> {
   validateAccountName(accountName);
   if (!Number.isFinite(windowResetAt) || windowResetAt <= 0) {
@@ -167,15 +171,24 @@ export async function claimAutoWarmupWindow(
     const hasRecentSuccess = state.records.some(
       (record) =>
         record.accountName === accountName &&
+        (record.windowKind ?? "5h") === windowKind &&
         record.status === "success" &&
         now - record.timestamp < successfulCooldownMs,
     );
-    const claimedResetAt = state.claimedWindowResetAtByAccount[accountName];
-    const claimedAt = state.claimedAtByAccount[accountName];
+    const resetMap =
+      windowKind === "7d"
+        ? state.weeklyClaimedWindowResetAtByAccount
+        : state.claimedWindowResetAtByAccount;
+    const claimMap =
+      windowKind === "7d"
+        ? state.weeklyClaimedAtByAccount
+        : state.claimedAtByAccount;
+    const claimedResetAt = resetMap[accountName];
+    const claimedAt = claimMap[accountName];
     const hasLiveClaim =
       claimedAt !== undefined && now - claimedAt < AUTO_WARMUP_CLAIM_LEASE_MS;
     if (
-      hasRecentSuccess ||
+      (!bypassSuccessCooldown && hasRecentSuccess) ||
       hasLiveClaim ||
       (claimedResetAt !== undefined && claimedResetAt >= windowResetAt)
     ) {
@@ -184,14 +197,21 @@ export async function claimAutoWarmupWindow(
     lease.throwIfCompromised();
     writePrivateJson(AUTO_WARMUP_STATE_PATH, {
       ...state,
-      claimedWindowResetAtByAccount: {
-        ...state.claimedWindowResetAtByAccount,
-        [accountName]: windowResetAt,
-      },
-      claimedAtByAccount: {
-        ...state.claimedAtByAccount,
-        [accountName]: now,
-      },
+      ...(windowKind === "7d"
+        ? {
+            weeklyClaimedWindowResetAtByAccount: {
+              ...resetMap,
+              [accountName]: windowResetAt,
+            },
+            weeklyClaimedAtByAccount: { ...claimMap, [accountName]: now },
+          }
+        : {
+            claimedWindowResetAtByAccount: {
+              ...resetMap,
+              [accountName]: windowResetAt,
+            },
+            claimedAtByAccount: { ...claimMap, [accountName]: now },
+          }),
     } satisfies AutoWarmupState);
     return true;
   } finally {
@@ -342,6 +362,10 @@ function readAutoWarmupState(): AutoWarmupState {
         !isRecord(value.claimedWindowResetAtByAccount)) ||
       (value.claimedAtByAccount !== undefined &&
         !isRecord(value.claimedAtByAccount)) ||
+      (value.weeklyClaimedWindowResetAtByAccount !== undefined &&
+        !isRecord(value.weeklyClaimedWindowResetAtByAccount)) ||
+      (value.weeklyClaimedAtByAccount !== undefined &&
+        !isRecord(value.weeklyClaimedAtByAccount)) ||
       (value.records !== undefined && !Array.isArray(value.records))
     ) {
       throw new Error("codex-account-auto-warmup.json 数据结构无效。");
@@ -358,6 +382,14 @@ function readAutoWarmupState(): AutoWarmupState {
       version: 1,
       claimedWindowResetAtByAccount,
       claimedAtByAccount,
+      weeklyClaimedWindowResetAtByAccount: parseAccountTimestamps(
+        value.weeklyClaimedWindowResetAtByAccount,
+        "每周自动唤醒窗口记录",
+      ),
+      weeklyClaimedAtByAccount: parseAccountTimestamps(
+        value.weeklyClaimedAtByAccount,
+        "每周自动唤醒领取记录",
+      ),
       records: (value.records ?? []).map(validateAutoWarmupRecord),
     };
   } catch (error) {
@@ -366,6 +398,8 @@ function readAutoWarmupState(): AutoWarmupState {
         version: 1,
         claimedWindowResetAtByAccount: {},
         claimedAtByAccount: {},
+        weeklyClaimedWindowResetAtByAccount: {},
+        weeklyClaimedAtByAccount: {},
         records: [],
       };
     }
@@ -403,6 +437,9 @@ function validateAutoWarmupRecord(value: unknown): AutoWarmupRecord {
     value.timestamp < 0 ||
     typeof value.accountName !== "string" ||
     (value.status !== "success" && value.status !== "failed") ||
+    (value.windowKind !== undefined &&
+      value.windowKind !== "5h" &&
+      value.windowKind !== "7d") ||
     (value.error !== undefined && typeof value.error !== "string")
   ) {
     throw new Error("自动启动记录数据无效。");
@@ -412,6 +449,7 @@ function validateAutoWarmupRecord(value: unknown): AutoWarmupRecord {
     timestamp: value.timestamp,
     accountName: value.accountName,
     status: value.status,
+    ...(value.windowKind === undefined ? {} : { windowKind: value.windowKind }),
     error: value.error,
   };
 }

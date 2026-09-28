@@ -1,6 +1,6 @@
 {
   "name": "account-usage",
-  "version": "1.0.0",
+  "version": "1.0.3",
   "description": "Codex multi-account management and Gemini quota display for Pi Coding Agent",
   "license": "MIT",
   "author": "TianYa-Q",
